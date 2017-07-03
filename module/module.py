@@ -47,19 +47,38 @@ properties = {
     'external': False,
     }
 
+
 def get_instance(plugin):
     """
     Called by the plugin manager to get a broker
     """
-    logger.debug("Get a Mongodb retention scheduler module for plugin %s" % plugin.get_name())
+    logger.debug("Get a Mongodb retention scheduler module for plugin %s" %
+                 plugin.get_name())
     if not MongoClient:
-        raise Exception('Could not use the pymongo module. Please verify your pymongo install.')
+        raise Exception('Could not use the pymongo module. Please verify your '
+                        'pymongo install.')
     uri = plugin.uri
     database = plugin.database
     username = getattr(plugin, 'username', '')
     password = getattr(plugin, 'password', '')
     replica_set = getattr(plugin, 'replica_set', '')
-    instance = Mongodb_retention_scheduler(plugin, uri, database, username, password, replica_set)
+    max_workers = getattr(plugin, 'max_workers', 4)
+    if not isinstance(max_workers, int) and not max_workers.isdigit():
+        logger.error('[MongodbRetention] Invalid max_workers parameter. '
+                     'Defaulting to default (4).')
+        max_workers = 4
+    max_workers = int(max_workers)
+    worker_timeout = getattr(plugin, 'worker_timeout', 30)
+    if not isinstance(worker_timeout, int) and not worker_timeout.isdigit():
+        logger.error('[MongodbRetention] Invalid worker_timeout parameter. '
+                     'Defaulting to default (4).')
+        worker_timeout = 30
+    worker_timeout = int(worker_timeout)
+    if worker_timeout == 0:
+        worker_timeout = None
+    instance = Mongodb_retention_scheduler(plugin, uri, database, username,
+                                           password, replica_set, max_workers,
+                                           worker_timeout)
     return instance
 
 
@@ -71,20 +90,22 @@ def chunks(l, n):
 
 
 class Mongodb_retention_scheduler(BaseModule):
-    def __init__(self, modconf, uri, database, username, password, replica_set):
+    def __init__(self, modconf, uri, database, username, password, replica_set,
+                 max_workers, worker_timeout):
         BaseModule.__init__(self, modconf)
         self.uri = uri
         self.database = database
         self.username = username
         self.password = password
         self.replica_set = replica_set
-        self.max_workers = 4
-        # Older versions don't handle replicasets and don't have the fsync option
+        self.max_workers = max_workers
+        self.worker_timeout = worker_timeout
+        # Older versions don't handle replicasets and don't have the fsync
+        # option
         if version < 2:
             logger.error('[MongodbRetention] Your pymongo lib is too old. '
                          'Please install at least a 2.x+ version.')
             return None
-
 
     def init(self):
         """
@@ -93,16 +114,15 @@ class Mongodb_retention_scheduler(BaseModule):
         logger.debug("Initialization of the mongodb module")
 
         if self.replica_set:
-            self.con = MongoClient(self.uri, replicaSet=self.replica_set, fsync=False)
+            self.con = MongoClient(self.uri, replicaSet=self.replica_set,
+                                   fsync=False)
         else:
             self.con = MongoClient(self.uri, fsync=False)
 
-        #self.con = Connection(self.uri)
-        # Open a gridfs connection
         self.db = getattr(self.con, self.database)
         if self.username != '' and self.password != '':
             self.db.authenticate(self.username, self.password)
-        self.hosts_fs = getattr(self.db, 'retention_hosts_raw') #GridFS(self.db, collection='retention_hosts')
+        self.hosts_fs = getattr(self.db, 'retention_hosts_raw')
         self.services_fs = getattr(self.db, 'retention_services_raw')
 
     def job(self, all_data, wid, offset):
@@ -115,35 +135,34 @@ class Mongodb_retention_scheduler(BaseModule):
             self.con.close()
 
     def _job(self, all_data, wid, offset):
-        t0 = time.time()
         # Reinit the mongodb connection if need
         self.init()
-        all_objs = {'hosts':{}, 'services':{}}
+        all_objs = {'hosts': {}, 'services': {}}
         date = datetime.datetime.utcnow()
 
         hosts = all_data['hosts']
         services = all_data['services']
 
         # Prepare the encoding for all managed hosts
-        i = -1
-        for h_name in hosts:
-            # Only manage the worker id element of the offset (number of workers)
-            # elements
-            i += 1
+        for i, h_name in enumerate(hosts):
+            # Only manage the worker id element of the offset (number of
+            # workers) elements
             if (i % offset) != wid:
                 continue
             h = hosts[h_name]
             key = "HOST-%s" % h_name
             val = cPickle.dumps(h, protocol=cPickle.HIGHEST_PROTOCOL)
-            val2 = base64.b64encode(val)
+            b64_val = base64.b64encode(val)
             # We save it in the Gridfs for hosts
-            all_objs['hosts'][key] = {'_id':key, 'value':val2, 'date':date}
+            all_objs['hosts'][key] = {
+                '_id': key,
+                'value': b64_val,
+                'date': date
+            }
 
-        i = -1
-        for (h_name, s_desc) in services:
-            i += 1
-            # Only manage the worker id element of the offset (number of workers)
-            # elements
+        for i, (h_name, s_desc) in enumerate(services):
+            # Only manage the worker id element of the offset (number of
+            # workers) elements
             if (i % offset) != wid:
                 continue
             s = services[(h_name, s_desc)]
@@ -151,17 +170,21 @@ class Mongodb_retention_scheduler(BaseModule):
             # space are not allowed in a key.. so change it by SPACE token
             key = key.replace(' ', 'SPACE')
             val = cPickle.dumps(s, protocol=cPickle.HIGHEST_PROTOCOL)
-            val2 = base64.b64encode(val)
-            all_objs['services'][key] = {'_id':key, 'value':val2, 'date':date}
+            b64_val = base64.b64encode(val)
+            all_objs['services'][key] = {
+                '_id': key,
+                'value': b64_val,
+                'date': date
+            }
 
         if len(all_objs['hosts']) != 0:
             # Do bulk insert of 500 elements (~500K insert)
             lsts = list(chunks(all_objs['hosts'].values(), 500))
             for lst in lsts:
-                bulk=self.hosts_fs.initialize_unordered_bulk_op()
+                bulk = self.hosts_fs.initialize_unordered_bulk_op()
                 for doc in lst:
                     bulk.find({'_id': doc['_id']}).upsert().replace_one(doc)
-                res = bulk.execute({'w': 0})
+                bulk.execute({'w': 0})
 
         if len(all_objs['services']) != 0:
             # Do bulk insert of 500 elements (~500K insert)
@@ -170,45 +193,52 @@ class Mongodb_retention_scheduler(BaseModule):
                 bulk = self.services_fs.initialize_unordered_bulk_op()
                 for doc in lst:
                     bulk.find({'_id': doc['_id']}).upsert().replace_one(doc)
-                res = bulk.execute({'w': 0})
+                bulk.execute({'w': 0})
 
         # Return and so quit this sub-process
         return
-
 
     def hook_save_retention(self, daemon):
         """
         main function that is called in the retention creation pass
         """
-
-        try:
-            self.max_workers = cpu_count()
-        except NotImplementedError:
-            pass
-
         t0 = time.time()
-        logger.debug("[MongodbRetention] asking me to update the retention objects")
+        logger.debug("[MongodbRetention] asking me to update the retention "
+                     "objects")
 
         all_data = daemon.get_retention_data()
 
         processes = []
         for i in xrange(self.max_workers):
-            proc = Process(target=self.job, args=(all_data, i, self.max_workers))
+            proc = Process(
+                target=self.job,
+                args=(all_data, i, self.max_workers)
+            )
             proc.start()
             processes.append(proc)
 
-        # Allow 30s to join the sub-processes, should be enough
+        # Allow {worker_timeout}s to join the sub-processes
         for proc in processes:
-            proc.join(30)
+            proc.join(self.worker_timeout)
 
-        logger.info("Retention information updated in Mongodb (%.2fs)" % (time.time() - t0))
+        for i in xrange(len(processes)):
+            proc = processes[i]
+            if proc.is_alive():
+                logger.error("[MongodbRetention] Worker %d did not terminate "
+                             "in time. Perhaps worker_timeout (%d) is too "
+                             "small" % (i, self.worker_timeout))
+                proc.terminate()
 
+        logger.info("[MongodbRetention] Retention information updated in "
+                    "Mongodb (%.2fs)" % (time.time() - t0))
 
     # Should return if it succeed in the retention load or not
     def hook_load_retention(self, daemon):
+        t0 = time.time()
 
         # Now the new redis way :)
-        logger.debug("MongodbRetention] asking me to load the retention objects")
+        logger.debug("MongodbRetention] asking me to load the retention "
+                     "objects")
 
         # We got list of loaded data from retention uri
         ret_hosts = {}
@@ -237,7 +267,8 @@ class Mongodb_retention_scheduler(BaseModule):
 
         for s in daemon.services:
             key = "SERVICE-%s,%s" % (s.host.host_name, s.service_description)
-            # space are not allowed in memcache key.. so change it by SPACE token
+            # space are not allowed in memcache key.. so change it by SPACE
+            # token
             key = key.replace(' ', 'SPACE')
             if key in found_services:
                 val = found_services[key]
@@ -250,6 +281,7 @@ class Mongodb_retention_scheduler(BaseModule):
         # Ok, now comme load them scheduler :)
         daemon.restore_retention_data(all_data)
 
-        logger.info("[MongodbRetention] Retention objects loaded successfully.")
+        logger.info("[MongodbRetention] Retention information loaded from "
+                    "Mongodb (%.2fs)" % (time.time() - t0))
 
         return True
